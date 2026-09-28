@@ -3,7 +3,7 @@ import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import jwt from "@fastify/jwt";
 import rateLimit from "@fastify/rate-limit";
-import { PrismaClient } from "@prisma/client";
+import { BatchStatus, PrismaClient, UserRole } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -35,6 +35,11 @@ const batchSchema = z.object({
   harvestDate: z.iso.date(),
   quantityKg: z.number().positive().max(10000),
   floralSource: z.string().trim().max(120).optional(),
+});
+const lifecycleSchema = z.object({ status: z.enum(["PROCESSING", "SUBMITTED_FOR_VERIFICATION"]) });
+const verificationDecisionSchema = z.object({
+  decision: z.enum(["VERIFIED", "REJECTED"]),
+  note: z.string().trim().min(8).max(500),
 });
 
 type UserClaims = { sub: string; role: string; name: string; email: string };
@@ -68,6 +73,10 @@ export async function createApp(options: AppOptions = {}): Promise<FastifyInstan
     } catch {
       return failure(reply, 401, "Sign in to continue");
     }
+  };
+  const requireRoles = (...roles: UserRole[]) => async (request: FastifyRequest, reply: FastifyReply) => {
+    const claims = request.user as UserClaims;
+    if (!roles.includes(claims.role as UserRole)) return failure(reply, 403, "Your account cannot perform this action");
   };
 
   app.get("/api/health", async () => {
@@ -201,6 +210,57 @@ export async function createApp(options: AppOptions = {}): Promise<FastifyInstan
   app.get("/api/batches", { preHandler: authenticate }, async (request) => {
     const { sub } = request.user as UserClaims;
     return prisma.batch.findMany({ where: { beekeeperId: sub }, orderBy: { createdAt: "desc" }, include: { hive: { select: { name: true } }, events: { orderBy: { createdAt: "asc" } } } });
+  });
+
+  app.patch("/api/batches/:code/status", { preHandler: authenticate }, async (request, reply) => {
+    const parsed = lifecycleSchema.safeParse(request.body);
+    if (!parsed.success) return failure(reply, 400, parsed.error.issues[0]?.message ?? "Invalid batch status");
+    const { sub } = request.user as UserClaims;
+    const { code } = request.params as { code: string };
+    const batch = await prisma.batch.findFirst({ where: { code, beekeeperId: sub } });
+    if (!batch) return failure(reply, 404, "Batch not found");
+
+    const allowedNextStatus: Partial<Record<BatchStatus, BatchStatus>> = {
+      [BatchStatus.CREATED]: BatchStatus.PROCESSING,
+      [BatchStatus.PROCESSING]: BatchStatus.SUBMITTED_FOR_VERIFICATION,
+    };
+    if (allowedNextStatus[batch.status] !== parsed.data.status) return failure(reply, 409, `Batch cannot move from ${batch.status} to ${parsed.data.status}`);
+
+    const eventType = parsed.data.status === BatchStatus.PROCESSING ? "PROCESSING_STARTED" : "SUBMITTED_FOR_VERIFICATION";
+    const [updated] = await prisma.$transaction([
+      prisma.batch.update({ where: { id: batch.id }, data: { status: parsed.data.status } }),
+      prisma.batchEvent.create({ data: { batchId: batch.id, type: eventType, note: parsed.data.status === BatchStatus.PROCESSING ? "Batch moved to processing" : "Batch submitted for verifier review", actorId: sub } }),
+    ]);
+    return updated;
+  });
+
+  app.get("/api/verifier/batches", { preHandler: [authenticate, requireRoles(UserRole.VERIFIER, UserRole.ADMIN)] }, async () => {
+    return prisma.batch.findMany({
+      where: { status: BatchStatus.SUBMITTED_FOR_VERIFICATION },
+      orderBy: { createdAt: "asc" },
+      include: { hive: { select: { name: true, location: true } }, beekeeper: { select: { id: true, name: true } }, events: { orderBy: { createdAt: "asc" } } },
+    });
+  });
+
+  app.patch("/api/verifier/batches/:code/decision", { preHandler: [authenticate, requireRoles(UserRole.VERIFIER, UserRole.ADMIN)] }, async (request, reply) => {
+    const parsed = verificationDecisionSchema.safeParse(request.body);
+    if (!parsed.success) return failure(reply, 400, parsed.error.issues[0]?.message ?? "A review decision and note are required");
+    const { sub } = request.user as UserClaims;
+    const { code } = request.params as { code: string };
+    const batch = await prisma.batch.findUnique({ where: { code } });
+    if (!batch) return failure(reply, 404, "Batch not found");
+    if (batch.beekeeperId === sub) return failure(reply, 403, "A verifier cannot review their own batch");
+    if (batch.status !== BatchStatus.SUBMITTED_FOR_VERIFICATION) return failure(reply, 409, "Only submitted batches can be reviewed");
+
+    const currentDigest = digestBatch({ code: batch.code, hiveId: batch.hiveId, quantityKg: batch.quantityKg, harvestDate: batch.harvestDate.toISOString(), floralSource: batch.floralSource });
+    if (currentDigest.toLowerCase() !== batch.integrityDigest.toLowerCase()) return failure(reply, 409, "Batch data no longer matches its integrity digest");
+    if (await blockchain.verifyBatch(batch.code, currentDigest) !== true) return failure(reply, 409, "A valid blockchain anchor is required before verification");
+
+    const [updated] = await prisma.$transaction([
+      prisma.batch.update({ where: { id: batch.id }, data: { status: parsed.data.decision } }),
+      prisma.batchEvent.create({ data: { batchId: batch.id, type: `VERIFICATION_${parsed.data.decision}`, note: parsed.data.note, actorId: sub } }),
+    ]);
+    return updated;
   });
 
   app.get("/api/batches/:code", { preHandler: authenticate }, async (request, reply) => {

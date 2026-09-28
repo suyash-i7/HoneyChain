@@ -59,5 +59,6 @@ export type Batch = {
   blockchainNet?: string | null;
   createdAt: string;
   hive?: { name: string; location?: string };
+  beekeeper?: { id?: string; name: string };
   events: BatchEvent[];
 };

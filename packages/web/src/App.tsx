@@ -16,11 +16,11 @@ type PublicBatch = Omit<Batch, "hive"> & {
   chainVerified: boolean | null;
   verification: string;
 };
-type ModalState = "hive" | "batch" | "history" | "qr" | null;
+type ModalState = "hive" | "batch" | "history" | "qr" | "review" | null;
 
-function formatDate(value?: string) {
+function formatDate(value?: string, dateOnly = false) {
   if (!value) return "No readings yet";
-  const harvestDay = value.length === 10 || value.endsWith("T00:00:00.000Z");
+  const harvestDay = dateOnly || value.length === 10 || value.endsWith("T00:00:00.000Z");
   const options: Intl.DateTimeFormatOptions = harvestDay
     ? { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" }
     : { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" };
@@ -117,6 +117,7 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
   const [summary, setSummary] = useState<DashboardData | null>(null);
   const [hives, setHives] = useState<Hive[]>([]);
   const [batches, setBatches] = useState<Batch[]>([]);
+  const [reviewQueue, setReviewQueue] = useState<Batch[]>([]);
   const [blockchain, setBlockchain] = useState<{ configured: boolean; network: string | null }>({ configured: false, network: null });
   const [modal, setModal] = useState<ModalState>(null);
   const [selectedBatch, setSelectedBatch] = useState<Batch | null>(null);
@@ -127,13 +128,15 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
   async function refresh() {
     setError("");
     try {
-      const [dashboardData, hiveData, batchData, chainData] = await Promise.all([
+      const [dashboardData, hiveData, batchData, chainData, queueData] = await Promise.all([
         api<DashboardData>("/dashboard"), api<Hive[]>("/hives"), api<Batch[]>("/batches"), api<typeof blockchain>("/blockchain/status"),
+        user.role === "VERIFIER" || user.role === "ADMIN" ? api<Batch[]>("/verifier/batches") : Promise.resolve([]),
       ]);
       setSummary(dashboardData);
       setHives(hiveData);
       setBatches(batchData);
       setBlockchain(chainData);
+      setReviewQueue(queueData);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load apiary data");
     } finally {
@@ -163,6 +166,16 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
     setModal(modalType);
   };
 
+  const advanceBatch = async (batch: Batch, status: "PROCESSING" | "SUBMITTED_FOR_VERIFICATION") => {
+    try {
+      await api(`/batches/${encodeURIComponent(batch.code)}/status`, { method: "PATCH", body: JSON.stringify({ status }) });
+      setFlash(status === "PROCESSING" ? `${batch.code} moved to processing` : `${batch.code} submitted for review`);
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not update the batch");
+    }
+  };
+
   return (
     <div className="workspace">
       <aside className="sidebar">
@@ -172,6 +185,7 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
           <NavButton label="Overview" active={section === "Overview"} onClick={setSection} icon={<Activity size={17} />} />
           <NavButton label="Hives" active={section === "Hives"} onClick={setSection} icon={<HiveIcon size={17} />} count={hives.length} />
           <NavButton label="Honey batches" active={section === "Honey batches"} onClick={setSection} icon={<Boxes size={17} />} count={batches.length} />
+          {(user.role === "VERIFIER" || user.role === "ADMIN") && <NavButton label="Verifier queue" active={section === "Verifier queue"} onClick={setSection} icon={<BadgeCheck size={17} />} count={reviewQueue.length} />}
         </nav>
         <div className="sidebar-spacer" />
         <div className={`chain-card ${blockchain.configured ? "chain-live" : ""}`}>
@@ -181,7 +195,7 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
         </div>
         <div className="account-row">
           <div className="avatar">{user.name.slice(0, 1).toUpperCase()}</div>
-          <div className="account-copy"><strong>{user.name}</strong><span>Beekeeper</span></div>
+          <div className="account-copy"><strong>{user.name}</strong><span>{user.role === "VERIFIER" ? "Verifier / Lab" : user.role === "ADMIN" ? "Administrator" : user.role === "CONSUMER" ? "Consumer" : "Beekeeper"}</span></div>
           <button className="icon-button signout" title="Sign out" onClick={onSignOut}><LogOut size={16} /></button>
         </div>
       </aside>
@@ -196,7 +210,9 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
           {loading ? <ScreenLoader /> : section === "Hives" ? (
             <HivesView hives={hives} onAdd={() => setModal("hive")} onSimulate={createSensorReading} />
           ) : section === "Honey batches" ? (
-            <BatchesView batches={batches} hives={hives} onAdd={() => setModal("batch")} onHistory={(batch) => openBatch(batch, "history")} onQr={(batch) => openBatch(batch, "qr")} />
+            <BatchesView batches={batches} hives={hives} onAdd={() => setModal("batch")} onHistory={(batch) => openBatch(batch, "history")} onQr={(batch) => openBatch(batch, "qr")} onAdvance={advanceBatch} />
+          ) : section === "Verifier queue" && (user.role === "VERIFIER" || user.role === "ADMIN") ? (
+            <VerifierQueue batches={reviewQueue} onReview={(batch) => { setSelectedBatch(batch); setModal("review"); }} />
           ) : (
             <OverviewView user={user} summary={summary} hives={hives} batches={batches} blockchain={blockchain} onAddHive={() => setModal("hive")} onAddBatch={() => setModal("batch")} onSection={setSection} onHistory={(batch) => openBatch(batch, "history")} onQr={(batch) => openBatch(batch, "qr")} onSimulate={createSensorReading} />
           )}
@@ -209,6 +225,7 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
         {modal === "batch" && <BatchForm hives={hives} onCancel={() => setModal(null)} onCreated={async () => { setModal(null); setFlash("Harvest added to traceability"); await refresh(); }} />}
         {modal === "history" && selectedBatch && <BatchHistory batch={selectedBatch} onQr={() => setModal("qr")} />}
         {modal === "qr" && selectedBatch && <BatchQr batch={selectedBatch} />}
+        {modal === "review" && selectedBatch && <ReviewForm batch={selectedBatch} onCancel={() => setModal(null)} onReviewed={async () => { setModal(null); setFlash(`${selectedBatch.code} review recorded`); await refresh(); }} />}
       </Modal>}
     </div>
   );
@@ -293,15 +310,28 @@ function ReadingRow({ reading }: { reading: SensorReading }) {
   return <div className="reading-row"><span className="reading-origin"><i />{reading.source === "SIMULATOR" ? "SIM" : reading.source}</span><div className="reading-row-name"><strong>{reading.hive?.name ?? "Hive"}</strong><span>{formatDate(reading.recordedAt)}</span></div><div className="reading-values"><span><Thermometer size={13} />{reading.temperatureC}°</span><span><Wind size={13} />{reading.humidityPct}%</span></div></div>;
 }
 
-function BatchesView({ batches, hives, onAdd, onHistory, onQr }: { batches: Batch[]; hives: Hive[]; onAdd: () => void; onHistory: (batch: Batch) => void; onQr: (batch: Batch) => void }) {
+function BatchesView({ batches, hives, onAdd, onHistory, onQr, onAdvance }: { batches: Batch[]; hives: Hive[]; onAdd: () => void; onHistory: (batch: Batch) => void; onQr: (batch: Batch) => void; onAdvance: (batch: Batch, status: "PROCESSING" | "SUBMITTED_FOR_VERIFICATION") => void }) {
   return <>
     <PageHeading eyebrow="HARVEST PROVENANCE" title="Honey batches" description="Every harvest gets a unique code, a history and a consumer verification link." action={<button className="button button-primary" onClick={onAdd} disabled={!hives.length}><Plus size={17} /> Record harvest</button>} />
-    <section className="panel batches-panel full-batches-panel">{batches.length ? <BatchTable batches={batches} onHistory={onHistory} onQr={onQr} /> : <EmptyState icon={<Boxes size={22} />} title={hives.length ? "Your first batch starts here" : "Register a hive before recording harvest"} detail={hives.length ? "Select a hive, enter harvest quantity and create its traceability record." : "Harvests are tied to their source hive to preserve provenance."} action={hives.length ? <button className="button button-primary" onClick={onAdd}><Plus size={16} /> Record harvest</button> : undefined} />}</section>
+    <section className="panel batches-panel full-batches-panel">{batches.length ? <BatchTable batches={batches} onHistory={onHistory} onQr={onQr} onAdvance={onAdvance} /> : <EmptyState icon={<Boxes size={22} />} title={hives.length ? "Your first batch starts here" : "Register a hive before recording harvest"} detail={hives.length ? "Select a hive, enter harvest quantity and create its traceability record." : "Harvests are tied to their source hive to preserve provenance."} action={hives.length ? <button className="button button-primary" onClick={onAdd}><Plus size={16} /> Record harvest</button> : undefined} />}</section>
   </>;
 }
 
-function BatchTable({ batches, onHistory, onQr }: { batches: Batch[]; onHistory: (batch: Batch) => void; onQr: (batch: Batch) => void }) {
-  return <div className="table-wrap"><table><thead><tr><th>BATCH</th><th>HIVE / SOURCE</th><th>HARVESTED</th><th>QUANTITY</th><th>CHAIN STATUS</th><th aria-label="Actions" /></tr></thead><tbody>{batches.map((batch) => <tr key={batch.id}><td><button className="batch-code" onClick={() => onHistory(batch)}>{batch.code}<span>{batch.status.replaceAll("_", " ")}</span></button></td><td><strong className="table-primary">{batch.hive?.name ?? "Hive"}</strong><span className="table-secondary">{batch.floralSource || "Floral source not recorded"}</span></td><td>{new Intl.DateTimeFormat("en-IN", { day: "numeric", month: "short", year: "numeric" }).format(new Date(batch.harvestDate))}</td><td>{batch.quantityKg} kg</td><td><span className={`chain-status ${batch.blockchainTx ? "anchored" : "local"}`}><i />{batch.blockchainTx ? "Anchored" : "Local record"}</span></td><td><div className="table-actions"><button className="icon-button" title="View batch history" onClick={() => onHistory(batch)}><ClipboardList size={16} /></button><button className="icon-button" title="Show verification QR" onClick={() => onQr(batch)}><QrCode size={16} /></button></div></td></tr>)}</tbody></table></div>;
+function VerifierQueue({ batches, onReview }: { batches: Batch[]; onReview: (batch: Batch) => void }) {
+  return <>
+    <PageHeading eyebrow="LABORATORY REVIEW" title="Verifier queue" description="Review submitted batch records after their on-chain digest has been checked." />
+    <section className="panel verifier-panel">
+      {batches.length === 0 ? <EmptyState icon={<BadgeCheck size={22} />} title="No batches awaiting review" detail="Batches submitted by beekeepers will appear here." /> : <div className="review-list">{batches.map((batch) => <article className="review-row" key={batch.id}><div className="review-code"><strong>{batch.code}</strong><span>{batch.quantityKg} kg · {batch.hive?.name} · {batch.floralSource || "Floral source not recorded"}</span></div><div className="review-owner"><span>{batch.beekeeper?.name ?? "Beekeeper"}</span><small>{formatDate(batch.harvestDate, true)}</small></div><span className="chain-status anchored"><i />Anchored</span><button className="button button-light small-button" onClick={() => onReview(batch)}>Review batch <ArrowUpRight size={14} /></button></article>)}</div>}
+    </section>
+  </>;
+}
+
+function BatchTable({ batches, onHistory, onQr, onAdvance }: { batches: Batch[]; onHistory: (batch: Batch) => void; onQr: (batch: Batch) => void; onAdvance?: (batch: Batch, status: "PROCESSING" | "SUBMITTED_FOR_VERIFICATION") => void }) {
+  return <div className="table-wrap"><table><thead><tr><th>BATCH</th><th>HIVE / SOURCE</th><th>HARVESTED</th><th>QUANTITY</th><th>CHAIN STATUS</th>{onAdvance && <th>NEXT STEP</th>}<th aria-label="Actions" /></tr></thead><tbody>{batches.map((batch) => {
+    const nextStatus = batch.status === "CREATED" ? "PROCESSING" : batch.status === "PROCESSING" ? "SUBMITTED_FOR_VERIFICATION" : null;
+    const nextLabel = nextStatus === "PROCESSING" ? "Start processing" : nextStatus === "SUBMITTED_FOR_VERIFICATION" ? "Submit for review" : null;
+    return <tr key={batch.id}><td><button className="batch-code" onClick={() => onHistory(batch)}>{batch.code}<span>{batch.status.replaceAll("_", " ")}</span></button></td><td><strong className="table-primary">{batch.hive?.name ?? "Hive"}</strong><span className="table-secondary">{batch.floralSource || "Floral source not recorded"}</span></td><td>{formatDate(batch.harvestDate, true)}</td><td>{batch.quantityKg} kg</td><td><span className={`chain-status ${batch.blockchainTx ? "anchored" : "local"}`}><i />{batch.blockchainTx ? "Anchored" : "Local record"}</span></td>{onAdvance && <td>{nextStatus && nextLabel ? <button className="workflow-button" onClick={() => onAdvance(batch, nextStatus)}>{nextLabel}</button> : <span className="table-secondary">{batch.status.replaceAll("_", " ")}</span>}</td>}<td><div className="table-actions"><button className="icon-button" title="View batch history" onClick={() => onHistory(batch)}><ClipboardList size={16} /></button><button className="icon-button" title="Show verification QR" onClick={() => onQr(batch)}><QrCode size={16} /></button></div></td></tr>;
+  })}</tbody></table></div>;
 }
 
 function EmptyState({ icon, title, detail, action }: { icon: ReactNode; title: string; detail: string; action?: ReactNode }) {
@@ -349,6 +379,21 @@ function BatchForm({ hives, onCancel, onCreated }: { hives: Hive[]; onCancel: ()
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not record harvest"); } finally { setBusy(false); }
   }
   return <FormModal title="Record a harvest" description="Create a batch linked to its hive and harvest details." onCancel={onCancel} onSubmit={submit} submitLabel={busy ? "Saving…" : "Create batch"}><label>Source hive<select name="hiveId" required defaultValue=""><option value="" disabled>Select a registered hive</option>{hives.map((hive) => <option key={hive.id} value={hive.id}>{hive.name} · {hive.location}</option>)}</select></label><div className="form-pair"><label>Harvest date<input name="harvestDate" type="date" max={new Date().toISOString().slice(0, 10)} defaultValue={new Date().toISOString().slice(0, 10)} required /></label><label>Quantity harvested<input name="quantityKg" type="number" min="0.01" max="10000" step="0.01" placeholder="e.g. 18.5" required /></label></div><label>Floral source <span className="optional-label">OPTIONAL</span><input name="floralSource" placeholder="e.g. Mustard, eucalyptus" /></label><div className="form-info"><ShieldCheck size={16} /><span>A digest of these batch details is prepared for blockchain anchoring. Full records stay in HoneyChain.</span></div>{error && <p className="form-error" role="alert">{error}</p>}</FormModal>;
+}
+
+function ReviewForm({ batch, onCancel, onReviewed }: { batch: Batch; onCancel: () => void; onReviewed: () => void }) {
+  const [decision, setDecision] = useState<"VERIFIED" | "REJECTED">("VERIFIED");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setError(""); setBusy(true);
+    const form = new FormData(event.currentTarget);
+    try {
+      await api(`/verifier/batches/${encodeURIComponent(batch.code)}/decision`, { method: "PATCH", body: JSON.stringify({ decision, note: form.get("note") }) });
+      onReviewed();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not save the review"); } finally { setBusy(false); }
+  }
+  return <form onSubmit={submit} className="modal-form"><div className="modal-heading"><div><p className="eyebrow">VERIFIER REVIEW</p><h2>{batch.code}</h2><p className="muted">{batch.quantityKg} kg · {batch.hive?.name} · {batch.beekeeper?.name}</p></div><button type="button" className="icon-button" aria-label="Close" onClick={onCancel}><X size={18} /></button></div><div className="modal-fields"><label>Review outcome<select value={decision} onChange={(event) => setDecision(event.target.value as "VERIFIED" | "REJECTED")}><option value="VERIFIED">Verify batch</option><option value="REJECTED">Reject batch</option></select></label><label>Review note<textarea name="note" minLength={8} maxLength={500} rows={4} placeholder="Record the inspection result and evidence" required /></label><div className="form-info"><ShieldCheck size={16} /><span>Approval is recorded only when batch data matches its blockchain digest. Your decision and note become part of the batch history.</span></div>{error && <p className="form-error" role="alert">{error}</p>}</div><div className="modal-actions"><button type="button" className="button button-quiet" onClick={onCancel}>Cancel</button><button className="button button-primary" disabled={busy}>{busy ? "Saving…" : decision === "VERIFIED" ? "Verify batch" : "Reject batch"}<ArrowUpRight size={16} /></button></div></form>;
 }
 
 function BatchHistory({ batch, onQr }: { batch: Batch; onQr: () => void }) {

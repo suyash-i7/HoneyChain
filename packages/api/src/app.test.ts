@@ -2,20 +2,23 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, before, test } from "node:test";
 import { PrismaClient } from "@prisma/client";
+import bcrypt from "bcryptjs";
 import { createApp } from "./app.js";
 
 const prisma = new PrismaClient();
+let blockchainAvailable = false;
 const appPromise = createApp({
   prisma,
   jwtSecret: "integration-test-secret-that-is-long-enough",
   blockchain: {
-    isConfigured: () => false,
+    isConfigured: () => blockchainAvailable,
     anchorBatch: async () => null,
-    verifyBatch: async () => null,
+    verifyBatch: async () => blockchainAvailable ? true : null,
   },
 });
 let beekeeperId = "";
 let secondaryUserId = "";
+let verifierId = "";
 let hiveId = "";
 let batchId = "";
 
@@ -28,6 +31,7 @@ after(async () => {
   if (batchId) await prisma.batch.deleteMany({ where: { id: batchId } });
   if (beekeeperId) await prisma.user.deleteMany({ where: { id: beekeeperId } });
   if (secondaryUserId) await prisma.user.deleteMany({ where: { id: secondaryUserId } });
+  if (verifierId) await prisma.user.deleteMany({ where: { id: verifierId } });
   await (await appPromise).close();
   await prisma.$disconnect();
 });
@@ -85,9 +89,79 @@ test("beekeeper can register a hive, ingest sensors, create a batch, and expose 
   assert.match(batch.code, /^HC-\d{4}-[A-F0-9]{8}$/);
   assert.equal(batch.events[0].type, "BATCH_CREATED");
 
+  const invalidTransition = await app.inject({
+    method: "PATCH",
+    url: `/api/batches/${batch.code}/status`,
+    headers: auth,
+    payload: { status: "SUBMITTED_FOR_VERIFICATION" },
+  });
+  assert.equal(invalidTransition.statusCode, 409);
+
+  const processing = await app.inject({
+    method: "PATCH",
+    url: `/api/batches/${batch.code}/status`,
+    headers: auth,
+    payload: { status: "PROCESSING" },
+  });
+  assert.equal(processing.statusCode, 200);
+  assert.equal(processing.json().status, "PROCESSING");
+
+  const submission = await app.inject({
+    method: "PATCH",
+    url: `/api/batches/${batch.code}/status`,
+    headers: auth,
+    payload: { status: "SUBMITTED_FOR_VERIFICATION" },
+  });
+  assert.equal(submission.statusCode, 200);
+  assert.equal(submission.json().status, "SUBMITTED_FOR_VERIFICATION");
+
+  const beekeeperQueue = await app.inject({ method: "GET", url: "/api/verifier/batches", headers: auth });
+  assert.equal(beekeeperQueue.statusCode, 403);
+
+  const verifier = await prisma.user.create({
+    data: { name: "Lab Verifier", email: `verifier-${randomUUID()}@example.test`, passwordHash: await bcrypt.hash("verifier-test-password-123", 4), role: "VERIFIER" },
+  });
+  verifierId = verifier.id;
+  const verifierToken = app.jwt.sign({ sub: verifier.id, role: verifier.role, name: verifier.name, email: verifier.email });
+  const verifierAuth = { authorization: `Bearer ${verifierToken}` };
+
+  await prisma.batch.update({ where: { id: batchId }, data: { beekeeperId: verifierId } });
+  const selfReview = await app.inject({
+    method: "PATCH",
+    url: `/api/verifier/batches/${batch.code}/decision`,
+    headers: verifierAuth,
+    payload: { decision: "VERIFIED", note: "Reviewed the lab results" },
+  });
+  assert.equal(selfReview.statusCode, 403);
+  await prisma.batch.update({ where: { id: batchId }, data: { beekeeperId } });
+
+  const unavailableDecision = await app.inject({
+    method: "PATCH",
+    url: `/api/verifier/batches/${batch.code}/decision`,
+    headers: verifierAuth,
+    payload: { decision: "VERIFIED", note: "Reviewed the lab results" },
+  });
+  assert.equal(unavailableDecision.statusCode, 409);
+
+  blockchainAvailable = true;
+  const verifierQueue = await app.inject({ method: "GET", url: "/api/verifier/batches", headers: verifierAuth });
+  assert.equal(verifierQueue.statusCode, 200);
+  assert.equal(verifierQueue.json().length, 1);
+
+  const decision = await app.inject({
+    method: "PATCH",
+    url: `/api/verifier/batches/${batch.code}/decision`,
+    headers: verifierAuth,
+    payload: { decision: "VERIFIED", note: "Lab result and integrity digest checked" },
+  });
+  assert.equal(decision.statusCode, 200);
+  assert.equal(decision.json().status, "VERIFIED");
+
   const publicRecord = await app.inject({ method: "GET", url: `/api/public/batches/${batch.code}` });
   assert.equal(publicRecord.statusCode, 200);
-  assert.equal(publicRecord.json().verification, "NOT_ANCHORED");
+  assert.equal(publicRecord.json().verification, "VERIFIED_ON_CHAIN");
+  assert.equal(publicRecord.json().status, "VERIFIED");
+  assert.equal(publicRecord.json().events.at(-1).type, "VERIFICATION_VERIFIED");
   assert.equal(publicRecord.json().hive.name, "Test orchard hive");
 
   await prisma.batch.update({ where: { id: batchId }, data: { quantityKg: 99 } });

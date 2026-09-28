@@ -14,7 +14,8 @@
     "db:generate": "npm run db:generate --workspace @honeychain/api",
     "db:push": "npm run db:push --workspace @honeychain/api",
     "chain:compile": "npm run compile --workspace @honeychain/contracts",
-    "chain:reanchor": "node scripts/reanchor.cjs"
+    "chain:reanchor": "node scripts/reanchor.cjs",
+    "users:bootstrap": "node scripts/bootstrap-users.cjs"
   },
   "devDependencies": {
     "dotenv": "^17.2.2",
