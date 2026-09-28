@@ -54,17 +54,33 @@ function runNpm(args, label) {
 async function waitForChain(child) {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     if (child.exitCode !== null) throw new Error("Local blockchain stopped before becoming ready");
-    try {
-      const response = await fetch(process.env.BLOCKCHAIN_RPC_URL, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
-      });
-      if (response.ok) return;
-    } catch {}
+    const chainId = await getChainId();
+    if (chainId !== null) {
+      assertExpectedChain(chainId);
+      return;
+    }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   throw new Error("Local blockchain did not become ready within 30 seconds");
+}
+
+async function getChainId() {
+  try {
+    const response = await fetch(process.env.BLOCKCHAIN_RPC_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
+    });
+    const result = await response.json();
+    return response.ok && result.result ? BigInt(result.result) : null;
+  } catch {
+    return null;
+  }
+}
+
+function assertExpectedChain(chainId) {
+  const expected = BigInt(process.env.BLOCKCHAIN_CHAIN_ID ?? "31337");
+  if (chainId !== expected) throw new Error(`RPC endpoint is on chain ${chainId}; expected local chain ${expected}`);
 }
 
 async function fundLocalSigner() {
@@ -100,8 +116,16 @@ async function start() {
   prepareEnvironment();
   runNpm(["run", "db:generate"], "Generate database client");
 
-  const chain = startNpm(["run", "node", "--workspace", "@honeychain/contracts"], "chain");
-  await waitForChain(chain);
+  let ownsChain = false;
+  const existingChainId = await getChainId();
+  if (existingChainId !== null) {
+    assertExpectedChain(existingChainId);
+    console.log(`[chain] Reusing local development chain ${existingChainId}`);
+  } else {
+    const chain = startNpm(["run", "node", "--workspace", "@honeychain/contracts"], "chain");
+    await waitForChain(chain);
+    ownsChain = true;
+  }
   await fundLocalSigner();
   const deployOutput = runNpm(["run", "deploy:local", "--workspace", "@honeychain/contracts"], "Deploy local batch registry");
   const contractAddress = deployOutput.match(/CONTRACT_ADDRESS=(0x[a-fA-F0-9]{40})/)?.[1];
@@ -115,7 +139,9 @@ async function start() {
   startNpm(["run", "dev", "--workspace", "@honeychain/web"], "web");
   console.log("\nHoneyChain is starting at http://localhost:5173");
   console.log("Local API: http://localhost:3001/api/health");
-  console.log("Press Ctrl+C to stop the API, web server, and local chain.\n");
+  console.log(ownsChain
+    ? "Press Ctrl+C to stop the API, web server, and local chain.\n"
+    : "Press Ctrl+C to stop the API and web server. The reused local chain will remain running.\n");
 }
 
 process.on("SIGINT", () => { stopChildren(); process.exit(0); });

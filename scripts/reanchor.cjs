@@ -1,4 +1,4 @@
-const { Contract, JsonRpcProvider, Wallet } = require("ethers");
+const { Contract, JsonRpcProvider, NonceManager, Wallet } = require("ethers");
 const { readFileSync } = require("node:fs");
 const path = require("node:path");
 const { PrismaClient } = require("@prisma/client");
@@ -10,7 +10,7 @@ Object.assign(process.env, dotenv.config({ path: path.join(root, ".env"), quiet:
 async function main() {
   const prisma = new PrismaClient();
   const provider = new JsonRpcProvider(process.env.BLOCKCHAIN_RPC_URL);
-  const signer = new Wallet(process.env.BLOCKCHAIN_PRIVATE_KEY, provider);
+  const signer = new NonceManager(new Wallet(process.env.BLOCKCHAIN_PRIVATE_KEY, provider));
   const artifact = JSON.parse(readFileSync(path.join(root, "packages/contracts/artifacts/contracts/BatchRegistry.sol/BatchRegistry.json"), "utf8"));
   const registry = new Contract(process.env.CONTRACT_ADDRESS, artifact.abi, signer);
   const network = await provider.getNetwork();
