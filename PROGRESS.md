@@ -1,5 +1,5 @@
 Current Phase: 2 - Batch lifecycle and verification
-Completed: Foundation plus constrained batch lifecycle, role-gated verifier queue, chain-gated decisions, audit events, and opt-in verifier/admin provisioning; production builds and integration tests pass.
-Current: Verifier API and UI are implemented; beekeeper transition, access control, self-review rejection, and chain-proof checks are covered by SQLite integration tests.
-Next: Run the updated workflow in the browser with a provisioned verifier, then implement evidence-based colony health and productivity analytics.
-Blockers: Verifier credentials must be configured in ignored `.env` before browser review; three high npm audit advisories remain in Prisma's transitive `deepmerge-ts` dependency.
+Completed: Beekeeper submission, real verifier approval/rejection, role checks, self-review denial, chain-proof gating, public status display, audit history, integration tests and production builds.
+Current: Browser workflow passed on local chain 31337; both public records show the correct decision and confirmed digest. Temporary verifier account removed.
+Next: Implement evidence-based hive health and productivity analytics, grounded in SIH26021 requirements.
+Blockers: No persistent verifier credentials are configured. Prisma 6.19.3 pulls `@prisma/config` 6.19.3 and vulnerable `deepmerge-ts` 7.1.5; npm only suggests a semver-major Prisma downgrade to 6.12.0, so no unsafe override/downgrade was applied. No forced audit fix was run.

@@ -296,7 +296,8 @@ th:first-child, td:first-child { padding-left: 3px; }
 .verify-badge.valid { color: #a9d1a9; }
 .verify-badge.invalid { margin: 0 auto 20px; color: #c87961; background: #f8eeea; }
 .verify-badge.pending { color: #e3be77; }
-.verify-facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 11px; margin: 14px 0; }
+.verify-badge.rejected { color: #e8a08b; }
+.verify-facts { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 11px; margin: 14px 0; }
 .fact-card { display: grid; min-height: 132px; align-content: start; gap: 8px; padding: 14px; border: 1px solid #e6eae2; border-radius: 5px; background: #fff; }
 .fact-icon { display: grid; width: 28px; height: 28px; place-items: center; margin-bottom: 2px; border-radius: 4px; color: #4b7958; background: #eaf1e8; }
 .fact-card > strong { overflow: hidden; color: #415347; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }

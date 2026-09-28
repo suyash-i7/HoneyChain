@@ -21,6 +21,7 @@ let secondaryUserId = "";
 let verifierId = "";
 let hiveId = "";
 let batchId = "";
+let rejectedBatchId = "";
 
 before(async () => {
   const app = await appPromise;
@@ -29,6 +30,7 @@ before(async () => {
 
 after(async () => {
   if (batchId) await prisma.batch.deleteMany({ where: { id: batchId } });
+  if (rejectedBatchId) await prisma.batch.deleteMany({ where: { id: rejectedBatchId } });
   if (beekeeperId) await prisma.user.deleteMany({ where: { id: beekeeperId } });
   if (secondaryUserId) await prisma.user.deleteMany({ where: { id: secondaryUserId } });
   if (verifierId) await prisma.user.deleteMany({ where: { id: verifierId } });
@@ -163,6 +165,37 @@ test("beekeeper can register a hive, ingest sensors, create a batch, and expose 
   assert.equal(publicRecord.json().status, "VERIFIED");
   assert.equal(publicRecord.json().events.at(-1).type, "VERIFICATION_VERIFIED");
   assert.equal(publicRecord.json().hive.name, "Test orchard hive");
+
+  const rejectionBatchResponse = await app.inject({
+    method: "POST",
+    url: "/api/batches",
+    headers: auth,
+    payload: { hiveId, harvestDate, quantityKg: 8.25, floralSource: "Eucalyptus" },
+  });
+  assert.equal(rejectionBatchResponse.statusCode, 201);
+  const rejectionBatch = rejectionBatchResponse.json();
+  rejectedBatchId = rejectionBatch.id;
+  for (const status of ["PROCESSING", "SUBMITTED_FOR_VERIFICATION"]) {
+    const transition = await app.inject({
+      method: "PATCH",
+      url: `/api/batches/${rejectionBatch.code}/status`,
+      headers: auth,
+      payload: { status },
+    });
+    assert.equal(transition.statusCode, 200);
+  }
+  const rejection = await app.inject({
+    method: "PATCH",
+    url: `/api/verifier/batches/${rejectionBatch.code}/decision`,
+    headers: verifierAuth,
+    payload: { decision: "REJECTED", note: "Moisture result exceeds the allowed range" },
+  });
+  assert.equal(rejection.statusCode, 200);
+  assert.equal(rejection.json().status, "REJECTED");
+  const rejectedPublicRecord = await app.inject({ method: "GET", url: `/api/public/batches/${rejectionBatch.code}` });
+  assert.equal(rejectedPublicRecord.json().verification, "VERIFIED_ON_CHAIN");
+  assert.equal(rejectedPublicRecord.json().status, "REJECTED");
+  assert.equal(rejectedPublicRecord.json().events.at(-1).type, "VERIFICATION_REJECTED");
 
   await prisma.batch.update({ where: { id: batchId }, data: { quantityKg: 99 } });
   const tamperedRecord = await app.inject({ method: "GET", url: `/api/public/batches/${batch.code}` });
