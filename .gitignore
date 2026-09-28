@@ -15,3 +15,4 @@ packages/contracts/typechain-types/
 .runtime/
 .DS_Store
 Thumbs.db
+PROGRESS.md

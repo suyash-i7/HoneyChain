@@ -7,7 +7,7 @@ import {
   LoaderCircle, LogOut, MapPin, Plus, QrCode, RefreshCw, ScanLine,
   ShieldCheck, Thermometer, Weight, Wind, X,
 } from "lucide-react";
-import { api, setAccessToken, type Batch, type Hive, type SensorReading, type User } from "./api";
+import { api, setAccessToken, type Batch, type Hive, type HiveAnalysis, type SensorReading, type User } from "./api";
 
 type DashboardData = { counts: { hives: number; batches: number }; readings: SensorReading[]; batches: Batch[] };
 type PublicBatch = Omit<Batch, "hive"> & {
@@ -15,6 +15,14 @@ type PublicBatch = Omit<Batch, "hive"> & {
   beekeeper: { name: string };
   chainVerified: boolean | null;
   verification: string;
+  chainProof: null | {
+    dataDigest: string;
+    recordedBy: string;
+    recordedAt: string;
+    network: string;
+    transactionHash: string | null;
+    contractAddress: string | null;
+  };
 };
 type ModalState = "hive" | "batch" | "history" | "qr" | "review" | null;
 
@@ -116,6 +124,7 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
   const [section, setSection] = useState("Overview");
   const [summary, setSummary] = useState<DashboardData | null>(null);
   const [hives, setHives] = useState<Hive[]>([]);
+  const [hiveInsights, setHiveInsights] = useState<Record<string, HiveAnalysis>>({});
   const [batches, setBatches] = useState<Batch[]>([]);
   const [reviewQueue, setReviewQueue] = useState<Batch[]>([]);
   const [blockchain, setBlockchain] = useState<{ configured: boolean; network: string | null }>({ configured: false, network: null });
@@ -132,8 +141,10 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
         api<DashboardData>("/dashboard"), api<Hive[]>("/hives"), api<Batch[]>("/batches"), api<typeof blockchain>("/blockchain/status"),
         user.role === "VERIFIER" || user.role === "ADMIN" ? api<Batch[]>("/verifier/batches") : Promise.resolve([]),
       ]);
+      const insightMap = hiveData.length ? Object.fromEntries(await Promise.all(hiveData.map(async (hive) => [hive.id, await api<HiveAnalysis>(`/hives/${hive.id}/analysis`)]))) : {};
       setSummary(dashboardData);
       setHives(hiveData);
+      setHiveInsights(insightMap);
       setBatches(batchData);
       setBlockchain(chainData);
       setReviewQueue(queueData);
@@ -214,7 +225,7 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
           ) : section === "Verifier queue" && (user.role === "VERIFIER" || user.role === "ADMIN") ? (
             <VerifierQueue batches={reviewQueue} onReview={(batch) => { setSelectedBatch(batch); setModal("review"); }} />
           ) : (
-            <OverviewView user={user} summary={summary} hives={hives} batches={batches} blockchain={blockchain} onAddHive={() => setModal("hive")} onAddBatch={() => setModal("batch")} onSection={setSection} onHistory={(batch) => openBatch(batch, "history")} onQr={(batch) => openBatch(batch, "qr")} onSimulate={createSensorReading} />
+            <OverviewView user={user} summary={summary} hives={hives} batches={batches} hiveInsights={hiveInsights} blockchain={blockchain} onAddHive={() => setModal("hive")} onAddBatch={() => setModal("batch")} onSection={setSection} onHistory={(batch) => openBatch(batch, "history")} onQr={(batch) => openBatch(batch, "qr")} onSimulate={createSensorReading} />
           )}
         </div>
       </main>
@@ -239,13 +250,15 @@ function PageHeading({ eyebrow, title, description, action }: { eyebrow: string;
   return <div className="page-heading"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p className="muted">{description}</p></div>{action}</div>;
 }
 
-function OverviewView({ user, summary, hives, batches, blockchain, onAddHive, onAddBatch, onSection, onHistory, onQr, onSimulate }: {
-  user: User; summary: DashboardData | null; hives: Hive[]; batches: Batch[];
+function OverviewView({ user, summary, hives, batches, hiveInsights, blockchain, onAddHive, onAddBatch, onSection, onHistory, onQr, onSimulate }: {
+  user: User; summary: DashboardData | null; hives: Hive[]; batches: Batch[]; hiveInsights: Record<string, HiveAnalysis>;
   blockchain: { configured: boolean; network: string | null };
   onAddHive: () => void; onAddBatch: () => void; onSection: (section: string) => void;
   onHistory: (batch: Batch) => void; onQr: (batch: Batch) => void; onSimulate: (hive: Hive) => void;
 }) {
   const latestReading = summary?.readings[0];
+  const featuredHive = hives[0];
+  const featuredInsight = featuredHive ? hiveInsights[featuredHive.id] : undefined;
   return <>
     <PageHeading eyebrow="FIELD OVERVIEW · APIARY 01" title={`Good day, ${user.name.split(" ")[0]}.`} description="Your colonies, sensor activity and harvest records in one place." action={<button className="button button-primary" onClick={onAddBatch}><Plus size={17} /> Record harvest</button>} />
     <section className="metric-grid" aria-label="Apiary summary">
@@ -277,7 +290,7 @@ function OverviewView({ user, summary, hives, batches, blockchain, onAddHive, on
       <div className="panel-heading"><div><span className="section-kicker">PROVENANCE LEDGER</span><h2>Recent honey batches</h2></div><button className="text-button" onClick={() => onSection("Honey batches")}>View all <ArrowUpRight size={15} /></button></div>
       {batches.length === 0 ? <EmptyState icon={<Boxes size={22} />} title="No harvests recorded" detail="A batch starts with a hive harvest and grows a traceable event history." action={hives.length ? <button className="button button-light" onClick={onAddBatch}><Plus size={16} /> Record first harvest</button> : undefined} /> : <BatchTable batches={batches.slice(0, 5)} onHistory={onHistory} onQr={onQr} />}
     </section>
-    <div className="overview-bottom"><div className="care-note"><Flower2 size={19} /><p><strong>Keep the field notes flowing.</strong><span>Regular readings make seasonal patterns easier to spot.</span></p><button onClick={() => hives[0] && onSimulate(hives[0])} disabled={!hives.length} className="text-button">Sample data <ArrowUpRight size={15} /></button></div><div className="ai-note"><span className="ai-spark">✳</span><p><strong>Colony insights</strong><span>AI analysis is planned; no model is active yet.</span></p><span className="coming-soon">PLANNED</span></div></div>
+    <div className="overview-bottom"><div className="care-note"><Flower2 size={19} /><p><strong>Keep the field notes flowing.</strong><span>Regular readings make seasonal patterns easier to spot.</span></p><button onClick={() => hives[0] && onSimulate(hives[0])} disabled={!hives.length} className="text-button">Sample data <ArrowUpRight size={15} /></button></div><div className="ai-note"><span className="ai-spark">✳</span><p><strong>Colony insights</strong><span>{featuredInsight ? featuredInsight.explanation : "Add sensor data to generate the first health check."}</span>{featuredInsight && <span className="insight-metrics">Disease risk: {featuredInsight.diseaseRisk === null ? "Unscored" : `${featuredInsight.diseaseRisk}/100`} · Productivity: {featuredInsight.productivityTrend}</span>}</p><span className="coming-soon">{featuredInsight ? featuredInsight.health : "WAITING"}</span></div></div>
   </>;
 }
 
@@ -419,10 +432,11 @@ function PublicVerification() {
 }
 
 function BatchDecisionBadge({ batch }: { batch: PublicBatch }) {
-  const verified = batch.status === "VERIFIED";
-  const rejected = batch.status === "REJECTED";
-  const label = verified ? "VERIFIED" : rejected ? "REJECTED" : batch.chainVerified ? "CHAIN CHECKED" : "RECORD FOUND";
-  return <div className={`verify-badge ${verified ? "valid" : rejected ? "rejected" : "pending"}`}>{verified ? <BadgeCheck size={27} /> : rejected ? <CircleX size={27} /> : <ShieldCheck size={27} />}<span>{label}</span></div>;
+  const proofMismatch = batch.verification === "OFFCHAIN_TAMPERED" || batch.verification === "CHAIN_MISMATCH";
+  const verified = batch.status === "VERIFIED" && batch.chainVerified === true && batch.verification === "VERIFIED_ON_CHAIN";
+  const rejected = batch.status === "REJECTED" && batch.chainVerified === true;
+  const label = proofMismatch ? "PROOF MISMATCH" : verified ? "VERIFIED" : rejected ? "REJECTED" : batch.chainVerified ? "CHAIN CHECKED" : "RECORD FOUND";
+  return <div className="decision-proof"><div className={`verify-badge ${proofMismatch || rejected ? "rejected" : verified ? "valid" : "pending"}`}>{proofMismatch || rejected ? <CircleX size={27} /> : verified ? <BadgeCheck size={27} /> : <ShieldCheck size={27} />}<span>{label}</span></div>{batch.chainProof && <dl className="chain-proof"><div><dt>NETWORK</dt><dd>{batch.chainProof.network}</dd></div><div><dt>CONTRACT</dt><dd title={batch.chainProof.contractAddress ?? "Unavailable"}>{batch.chainProof.contractAddress ?? "Unavailable"}</dd></div><div><dt>TRANSACTION</dt><dd title={batch.chainProof.transactionHash ?? "Unavailable"}>{batch.chainProof.transactionHash ?? "Unavailable"}</dd></div><div><dt>ON-CHAIN DIGEST</dt><dd title={batch.chainProof.dataDigest}>{batch.chainProof.dataDigest}</dd></div><div><dt>RECORDED BY</dt><dd title={batch.chainProof.recordedBy}>{batch.chainProof.recordedBy}</dd></div><div><dt>ANCHORED</dt><dd>{formatDate(batch.chainProof.recordedAt)}</dd></div></dl>}</div>;
 }
 
 function Fact({ label, value, detail, icon }: { label: string; value: string; detail: string; icon: ReactNode }) {

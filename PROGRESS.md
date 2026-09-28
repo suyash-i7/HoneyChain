@@ -1,5 +1,0 @@
-Current Phase: 2 - Batch lifecycle and verification
-Completed: Beekeeper submission, real verifier approval/rejection, role checks, self-review denial, chain-proof gating, public status display, audit history, integration tests and production builds.
-Current: Browser workflow passed on local chain 31337; both public records show the correct decision and confirmed digest. Restart recovery reuses a healthy local chain and sequentially re-anchors persisted batches. Temporary verifier account removed.
-Next: Implement evidence-based hive health and productivity analytics, grounded in SIH26021 requirements.
-Blockers: No persistent verifier credentials are configured. Prisma 6.19.3 pulls `@prisma/config` 6.19.3 and vulnerable `deepmerge-ts` 7.1.5; npm only suggests a semver-major Prisma downgrade to 6.12.0, so no unsafe override/downgrade was applied. No forced audit fix was run.

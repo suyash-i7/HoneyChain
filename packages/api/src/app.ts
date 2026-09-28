@@ -8,6 +8,7 @@ import bcrypt from "bcryptjs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { BlockchainService, digestBatch } from "./blockchain.js";
+import { DefaultHiveAnalysisProvider, type HiveAnalysisProvider } from "./ai.js";
 
 const registerSchema = z.object({
   name: z.string().trim().min(2).max(100),
@@ -44,7 +45,7 @@ const verificationDecisionSchema = z.object({
 
 type UserClaims = { sub: string; role: string; name: string; email: string };
 type BlockchainPort = Pick<BlockchainService, "isConfigured" | "anchorBatch" | "verifyBatch">;
-type AppOptions = { prisma?: PrismaClient; blockchain?: BlockchainPort; jwtSecret?: string };
+type AppOptions = { prisma?: PrismaClient; blockchain?: BlockchainPort & Partial<Pick<BlockchainService, "getBatchProof">>; jwtSecret?: string; analysisProvider?: HiveAnalysisProvider };
 
 function publicUser(user: { id: string; name: string; email: string; role: string }) {
   return { id: user.id, name: user.name, email: user.email, role: user.role };
@@ -57,6 +58,7 @@ function failure(reply: FastifyReply, statusCode: number, message: string) {
 export async function createApp(options: AppOptions = {}): Promise<FastifyInstance> {
   const prisma = options.prisma ?? new PrismaClient();
   const blockchain = options.blockchain ?? new BlockchainService();
+  const analysisProvider = options.analysisProvider ?? new DefaultHiveAnalysisProvider();
   const app = Fastify({ logger: process.env.NODE_ENV !== "test" });
   app.decorate("prisma", prisma);
   app.addHook("onClose", async () => {
@@ -131,6 +133,30 @@ export async function createApp(options: AppOptions = {}): Promise<FastifyInstan
   app.get("/api/hives", { preHandler: authenticate }, async (request) => {
     const { sub } = request.user as UserClaims;
     return prisma.hive.findMany({ where: { ownerId: sub }, orderBy: { createdAt: "desc" }, include: { readings: { orderBy: { recordedAt: "desc" }, take: 1 } } });
+  });
+
+  app.get("/api/hives/:hiveId/analysis", { preHandler: authenticate }, async (request, reply) => {
+    const { sub } = request.user as UserClaims;
+    const { hiveId } = request.params as { hiveId: string };
+    const hive = await prisma.hive.findFirst({ where: { id: hiveId, ownerId: sub }, select: { id: true } });
+    if (!hive) return failure(reply, 404, "Hive not found");
+
+    const readings = await prisma.sensorReading.findMany({
+      where: { hiveId },
+      orderBy: { recordedAt: "asc" },
+      take: 30,
+      select: { temperatureC: true, humidityPct: true, weightKg: true, recordedAt: true },
+    });
+
+    return analysisProvider.analyze({
+      hiveId,
+      readings: readings.map((reading) => ({
+        temperatureC: reading.temperatureC,
+        humidityPct: reading.humidityPct,
+        weightKg: reading.weightKg,
+        recordedAt: reading.recordedAt.toISOString(),
+      })),
+    });
   });
 
   app.post("/api/hives", { preHandler: authenticate }, async (request, reply) => {
@@ -279,9 +305,24 @@ export async function createApp(options: AppOptions = {}): Promise<FastifyInstan
     if (!batch) return failure(reply, 404, "Batch not found");
     const currentDigest = digestBatch({ code: batch.code, hiveId: batch.hiveId, quantityKg: batch.quantityKg, harvestDate: batch.harvestDate.toISOString(), floralSource: batch.floralSource });
     const offchainIntact = currentDigest.toLowerCase() === batch.integrityDigest.toLowerCase();
-    const chainVerified = offchainIntact ? await blockchain.verifyBatch(batch.code, currentDigest) : false;
+    const chainProof = await blockchain.getBatchProof?.(batch.code) ?? null;
+    const chainVerified = !offchainIntact
+      ? false
+      : blockchain.getBatchProof
+        ? chainProof ? chainProof.dataDigest.toLowerCase() === `0x${currentDigest}`.toLowerCase() : blockchain.isConfigured() ? false : null
+        : await blockchain.verifyBatch(batch.code, currentDigest);
     const verification = !offchainIntact ? "OFFCHAIN_TAMPERED" : chainVerified === true ? "VERIFIED_ON_CHAIN" : chainVerified === false ? "CHAIN_MISMATCH" : "NOT_ANCHORED";
-    return { ...batch, chainVerified, verification };
+    const { hiveId: _hiveId, ...publicBatch } = batch;
+    return {
+      ...publicBatch,
+      chainProof: chainProof ? {
+        ...chainProof,
+        transactionHash: batch.blockchainTx,
+        contractAddress: process.env.CONTRACT_ADDRESS ?? null,
+      } : null,
+      chainVerified,
+      verification,
+    };
   });
 
   app.get("/api/blockchain/status", async () => ({ configured: blockchain.isConfigured(), network: process.env.BLOCKCHAIN_CHAIN_ID ?? null, contractAddress: process.env.CONTRACT_ADDRESS ?? null }));

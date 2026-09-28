@@ -30,6 +30,12 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
 }
 
 export type User = { id: string; name: string; email: string; role: string };
+export type HiveAnalysis = {
+  health: "HEALTHY" | "OBSERVE" | "URGENT_REVIEW";
+  diseaseRisk: number | null;
+  productivityTrend: "RISING" | "STABLE" | "FALLING";
+  explanation: string;
+};
 export type SensorReading = {
   id: string;
   hiveId: string;

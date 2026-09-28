@@ -297,6 +297,11 @@ th:first-child, td:first-child { padding-left: 3px; }
 .verify-badge.invalid { margin: 0 auto 20px; color: #c87961; background: #f8eeea; }
 .verify-badge.pending { color: #e3be77; }
 .verify-badge.rejected { color: #e8a08b; }
+.decision-proof { display: grid; width: min(100%, 330px); flex: 0 1 330px; justify-items: center; gap: 12px; }
+.chain-proof { display: grid; width: 100%; gap: 8px; margin: 0; padding: 11px; border: 1px solid rgba(223, 240, 222, .2); border-radius: 4px; background: rgba(255,255,255,.06); }
+.chain-proof > div { display: grid; gap: 3px; min-width: 0; }
+.chain-proof dt { color: #b3c8b5; font-size: 7px; font-weight: 700; }
+.chain-proof dd { overflow-wrap: anywhere; margin: 0; color: #eff3e9; font-family: var(--mono); font-size: 8px; line-height: 1.45; }
 .verify-facts { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 11px; margin: 14px 0; }
 .fact-card { display: grid; min-height: 132px; align-content: start; gap: 8px; padding: 14px; border: 1px solid #e6eae2; border-radius: 5px; background: #fff; }
 .fact-icon { display: grid; width: 28px; height: 28px; place-items: center; margin-bottom: 2px; border-radius: 4px; color: #4b7958; background: #eaf1e8; }

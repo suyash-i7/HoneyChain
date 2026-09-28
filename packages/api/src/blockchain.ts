@@ -11,6 +11,13 @@ export type ChainAnchorResult = {
   network: string;
 };
 
+export type ChainBatchProof = {
+  dataDigest: string;
+  recordedBy: string;
+  recordedAt: string;
+  network: string;
+};
+
 export class BlockchainService {
   private readonly rpcUrl = process.env.BLOCKCHAIN_RPC_URL;
   private readonly contractAddress = process.env.CONTRACT_ADDRESS;
@@ -35,13 +42,25 @@ export class BlockchainService {
 
   async verifyBatch(code: string, digest: string): Promise<boolean | null> {
     if (!this.isConfigured()) return null;
+    const proof = await this.getBatchProof(code);
+    return proof ? proof.dataDigest.toLowerCase() === `0x${digest}`.toLowerCase() : false;
+  }
+
+  async getBatchProof(code: string): Promise<ChainBatchProof | null> {
+    if (!this.isConfigured()) return null;
     const provider = new JsonRpcProvider(this.rpcUrl);
     const contract = new Contract(this.contractAddress!, batchRegistryAbi, provider);
     try {
-      const record = await contract.getBatch(code);
-      return record.dataDigest.toLowerCase() === `0x${digest}`.toLowerCase();
+      const [record, network] = await Promise.all([contract.getBatch(code), provider.getNetwork()]);
+      if (record.recordedAt === 0n) return null;
+      return {
+        dataDigest: record.dataDigest.toLowerCase(),
+        recordedBy: record.recordedBy,
+        recordedAt: new Date(Number(record.recordedAt) * 1000).toISOString(),
+        network: network.chainId.toString(),
+      };
     } catch {
-      return false;
+      return null;
     }
   }
 }

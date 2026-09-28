@@ -2,6 +2,8 @@
 
 Local SIH26021 foundation for apiary records, sensor ingestion, harvest traceability and blockchain verification.
 
+Network: http://10.12.1.105:5173/
+
 ## Run
 
 ```powershell

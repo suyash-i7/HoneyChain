@@ -8,7 +8,7 @@ if (process.env.NODE_ENV === "production" && (!process.env.JWT_SECRET || process
 
 const app = await createApp();
 try {
-  await app.listen({ port, host: "127.0.0.1" });
+  await app.listen({ port, host: "0.0.0.0" });
 } catch (error) {
   app.log.error(error);
   process.exit(1);
