@@ -1,0 +1,109 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { after, before, test } from "node:test";
+import { PrismaClient } from "@prisma/client";
+import { createApp } from "./app.js";
+
+const prisma = new PrismaClient();
+const appPromise = createApp({
+  prisma,
+  jwtSecret: "integration-test-secret-that-is-long-enough",
+  blockchain: {
+    isConfigured: () => false,
+    anchorBatch: async () => null,
+    verifyBatch: async () => null,
+  },
+});
+let beekeeperId = "";
+let secondaryUserId = "";
+let hiveId = "";
+let batchId = "";
+
+before(async () => {
+  const app = await appPromise;
+  await app.ready();
+});
+
+after(async () => {
+  if (batchId) await prisma.batch.deleteMany({ where: { id: batchId } });
+  if (beekeeperId) await prisma.user.deleteMany({ where: { id: beekeeperId } });
+  if (secondaryUserId) await prisma.user.deleteMany({ where: { id: secondaryUserId } });
+  await (await appPromise).close();
+  await prisma.$disconnect();
+});
+
+test("beekeeper can register a hive, ingest sensors, create a batch, and expose verifiable history", async () => {
+  const app = await appPromise;
+  const email = `beekeeper-${randomUUID()}@example.test`;
+  const registration = await app.inject({
+    method: "POST",
+    url: "/api/auth/register",
+    payload: { name: "Field Tester", email, password: "field-test-password-123" },
+  });
+  assert.equal(registration.statusCode, 201);
+  const registered = registration.json();
+  beekeeperId = registered.user.id;
+  assert.equal(registered.user.role, "BEEKEEPER");
+  const token = registered.token as string;
+  const auth = { authorization: `Bearer ${token}` };
+
+  const health = await app.inject({ method: "GET", url: "/api/health" });
+  assert.equal(health.statusCode, 200);
+  assert.equal(health.json().database, "connected");
+
+  const hiveResponse = await app.inject({
+    method: "POST",
+    url: "/api/hives",
+    headers: auth,
+    payload: { name: "Test orchard hive", location: "Demo village", colonyType: "Apis mellifera" },
+  });
+  assert.equal(hiveResponse.statusCode, 201);
+  hiveId = hiveResponse.json().id;
+
+  const invalidReading = await app.inject({
+    method: "POST",
+    url: `/api/hives/${hiveId}/readings`,
+    headers: auth,
+    payload: { temperatureC: 100, humidityPct: 45, weightKg: 30, source: "MANUAL" },
+  });
+  assert.equal(invalidReading.statusCode, 400);
+
+  const simulatedReading = await app.inject({ method: "POST", url: `/api/hives/${hiveId}/readings/simulate`, headers: auth });
+  assert.equal(simulatedReading.statusCode, 201);
+  assert.equal(simulatedReading.json().source, "SIMULATOR");
+
+  const harvestDate = new Date().toISOString().slice(0, 10);
+  const batchResponse = await app.inject({
+    method: "POST",
+    url: "/api/batches",
+    headers: auth,
+    payload: { hiveId, harvestDate, quantityKg: 14.5, floralSource: "Mustard" },
+  });
+  assert.equal(batchResponse.statusCode, 201);
+  const batch = batchResponse.json();
+  batchId = batch.id;
+  assert.match(batch.code, /^HC-\d{4}-[A-F0-9]{8}$/);
+  assert.equal(batch.events[0].type, "BATCH_CREATED");
+
+  const publicRecord = await app.inject({ method: "GET", url: `/api/public/batches/${batch.code}` });
+  assert.equal(publicRecord.statusCode, 200);
+  assert.equal(publicRecord.json().verification, "NOT_ANCHORED");
+  assert.equal(publicRecord.json().hive.name, "Test orchard hive");
+
+  await prisma.batch.update({ where: { id: batchId }, data: { quantityKg: 99 } });
+  const tamperedRecord = await app.inject({ method: "GET", url: `/api/public/batches/${batch.code}` });
+  assert.equal(tamperedRecord.json().verification, "OFFCHAIN_TAMPERED");
+
+  const secondaryRegistration = await app.inject({
+    method: "POST",
+    url: "/api/auth/register",
+    payload: { name: "Other Keeper", email: `other-${randomUUID()}@example.test`, password: "other-field-password-123" },
+  });
+  secondaryUserId = secondaryRegistration.json().user.id;
+  const foreignReading = await app.inject({
+    method: "POST",
+    url: `/api/hives/${hiveId}/readings/simulate`,
+    headers: { authorization: `Bearer ${secondaryRegistration.json().token}` },
+  });
+  assert.equal(foreignReading.statusCode, 404);
+});

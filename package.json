@@ -1,0 +1,26 @@
+{
+  "name": "honeychain",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/api",
+    "packages/web",
+    "packages/contracts"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.cjs",
+    "build": "npm run build --workspaces --if-present",
+    "test": "node scripts/test.cjs",
+    "db:generate": "npm run db:generate --workspace @honeychain/api",
+    "db:push": "npm run db:push --workspace @honeychain/api",
+    "chain:compile": "npm run compile --workspace @honeychain/contracts",
+    "chain:reanchor": "node scripts/reanchor.cjs"
+  },
+  "devDependencies": {
+    "dotenv": "^17.2.2",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "ethers": "^6.15.0"
+  }
+}

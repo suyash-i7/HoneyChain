@@ -1,0 +1,14 @@
+{
+  "name": "@honeychain/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "node": "hardhat node --hostname 127.0.0.1",
+    "compile": "hardhat compile",
+    "deploy:local": "hardhat run scripts/deploy.cjs --network localhost"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.26.3"
+  }
+}

@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.db
+*.db-journal
+*.tsbuildinfo
+packages/api/prisma/dev.db
+packages/api/prisma/dev.db-journal
+packages/contracts/artifacts/
+packages/contracts/cache/
+packages/contracts/typechain-types/
+.runtime/
+.DS_Store
+Thumbs.db

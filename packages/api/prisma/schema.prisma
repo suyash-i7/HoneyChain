@@ -1,0 +1,89 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  BEEKEEPER
+  VERIFIER
+  ADMIN
+  CONSUMER
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         UserRole @default(BEEKEEPER)
+  createdAt    DateTime @default(now())
+  hives        Hive[]
+  batches      Batch[]
+}
+
+model Hive {
+  id          String          @id @default(cuid())
+  name        String
+  location    String
+  latitude    Float?
+  longitude   Float?
+  colonyType  String?
+  notes       String?
+  ownerId     String
+  owner       User            @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  readings    SensorReading[]
+  batches     Batch[]
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@index([ownerId])
+}
+
+model SensorReading {
+  id           String   @id @default(cuid())
+  hiveId       String
+  hive         Hive     @relation(fields: [hiveId], references: [id], onDelete: Cascade)
+  temperatureC Float
+  humidityPct  Float
+  weightKg     Float
+  source       String   @default("SIMULATOR")
+  recordedAt   DateTime @default(now())
+
+  @@index([hiveId, recordedAt])
+}
+
+model Batch {
+  id              String       @id @default(cuid())
+  code            String       @unique
+  harvestDate     DateTime
+  quantityKg     Float
+  floralSource   String?
+  status          String       @default("CREATED")
+  integrityDigest String
+  blockchainTx   String?
+  blockchainNet  String?
+  hiveId          String
+  hive            Hive         @relation(fields: [hiveId], references: [id], onDelete: Restrict)
+  beekeeperId     String
+  beekeeper       User         @relation(fields: [beekeeperId], references: [id], onDelete: Restrict)
+  events          BatchEvent[]
+  createdAt       DateTime     @default(now())
+
+  @@index([beekeeperId, createdAt])
+}
+
+model BatchEvent {
+  id         String   @id @default(cuid())
+  batchId    String
+  batch      Batch    @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  type       String
+  note       String
+  actorId    String?
+  createdAt  DateTime @default(now())
+
+  @@index([batchId, createdAt])
+}
