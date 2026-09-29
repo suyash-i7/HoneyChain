@@ -7,7 +7,7 @@ import { BatchStatus, PrismaClient, UserRole } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { z } from "zod";
-import { BlockchainService, digestBatch } from "./blockchain.js";
+import { batchStageProofKey, BlockchainService, digestBatch, digestBatchStage, type BatchStageDigestInput } from "./blockchain.js";
 import { DefaultHiveAnalysisProvider, type HiveAnalysisProvider } from "./ai.js";
 
 const registerSchema = z.object({
@@ -42,10 +42,51 @@ const verificationDecisionSchema = z.object({
   decision: z.enum(["VERIFIED", "REJECTED"]),
   note: z.string().trim().min(8).max(500),
 });
+const stageSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("PROCESSED"), processedAt: z.iso.date().optional(), method: z.string().trim().min(2).max(120), quantityKg: z.number().positive().max(10000), notes: z.string().trim().max(500).optional() }),
+  z.object({ type: z.literal("PACKAGED"), packagedAt: z.iso.date().optional(), packageType: z.string().trim().min(2).max(120).optional(), lotIdentifier: z.string().trim().max(100).optional(), quantityKg: z.number().positive().max(10000), notes: z.string().trim().max(500).optional() }),
+  z.object({ type: z.literal("DISTRIBUTED"), distributedAt: z.iso.date().optional(), destination: z.string().trim().min(2).max(160), quantityKg: z.number().positive().max(10000), notes: z.string().trim().max(500).optional() }),
+]);
 
 type UserClaims = { sub: string; role: string; name: string; email: string };
 type BlockchainPort = Pick<BlockchainService, "isConfigured" | "anchorBatch" | "verifyBatch">;
 type AppOptions = { prisma?: PrismaClient; blockchain?: BlockchainPort & Partial<Pick<BlockchainService, "getBatchProof">>; jwtSecret?: string; analysisProvider?: HiveAnalysisProvider };
+type LedgerStageType = "HARVESTED" | "VERIFIED" | "PROCESSED" | "PACKAGED" | "DISTRIBUTED" | "CONSUMER_VERIFIED";
+
+function stageData(input: BatchStageDigestInput) {
+  return { ...input, occurredAt: new Date(input.occurredAt).toISOString() };
+}
+
+function stageMetadata(stage: z.infer<typeof stageSchema>) {
+  if (stage.type === "PROCESSED") {
+    return { occurredAt: stage.processedAt ? new Date(`${stage.processedAt}T12:00:00.000Z`) : new Date(), metadata: { method: stage.method, quantityKg: stage.quantityKg, notes: stage.notes } };
+  }
+  if (stage.type === "PACKAGED") {
+    return { occurredAt: stage.packagedAt ? new Date(`${stage.packagedAt}T12:00:00.000Z`) : new Date(), metadata: { packageType: stage.packageType, lotIdentifier: stage.lotIdentifier, quantityKg: stage.quantityKg, notes: stage.notes } };
+  }
+  return { occurredAt: stage.distributedAt ? new Date(`${stage.distributedAt}T12:00:00.000Z`) : new Date(), metadata: { destination: stage.destination, quantityKg: stage.quantityKg, notes: stage.notes } };
+}
+
+function parseStageMetadata(metadataJson: string): Record<string, unknown> {
+  try {
+    const value: unknown = JSON.parse(metadataJson);
+    return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function publicStageMetadata(type: string, metadata: Record<string, unknown>) {
+  const publicFields: Record<string, string[]> = {
+    HARVESTED: ["quantityKg", "floralSource"],
+    VERIFIED: [],
+    PROCESSED: ["method", "quantityKg"],
+    PACKAGED: ["packageType", "lotIdentifier", "quantityKg"],
+    DISTRIBUTED: ["destination", "quantityKg"],
+    CONSUMER_VERIFIED: [],
+  };
+  return Object.fromEntries((publicFields[type] ?? []).filter((key) => metadata[key] !== undefined).map((key) => [key, metadata[key]]));
+}
 
 function publicUser(user: { id: string; name: string; email: string; role: string }) {
   return { id: user.id, name: user.name, email: user.email, role: user.role };
@@ -79,6 +120,79 @@ export async function createApp(options: AppOptions = {}): Promise<FastifyInstan
   const requireRoles = (...roles: UserRole[]) => async (request: FastifyRequest, reply: FastifyReply) => {
     const claims = request.user as UserClaims;
     if (!roles.includes(claims.role as UserRole)) return failure(reply, 403, "Your account cannot perform this action");
+  };
+
+  const appendStage = async (input: {
+    batchId: string;
+    batchCode: string;
+    batchDigest: string;
+    type: LedgerStageType;
+    occurredAt: Date;
+    actorId: string | null;
+    metadata: Record<string, unknown>;
+  }) => {
+    const previous = await prisma.batchStage.findFirst({ where: { batchId: input.batchId }, orderBy: { sequence: "desc" } });
+    const sequence = (previous?.sequence ?? 0) + 1;
+    const data = stageData({
+      batchCode: input.batchCode,
+      type: input.type,
+      sequence,
+      occurredAt: input.occurredAt.toISOString(),
+      actorId: input.actorId,
+      status: "RECORDED",
+      metadata: input.metadata,
+      previousDigest: previous?.digest ?? input.batchDigest,
+    });
+    const digest = digestBatchStage(data);
+    const proofKey = batchStageProofKey(input.batchCode, sequence);
+    const stage = await prisma.batchStage.create({ data: {
+      batchId: input.batchId,
+      type: input.type,
+      sequence,
+      occurredAt: input.occurredAt,
+      actorId: input.actorId,
+      metadataJson: JSON.stringify(input.metadata),
+      previousDigest: data.previousDigest,
+      digest,
+      proofKey,
+    } });
+
+    try {
+      const anchor = await blockchain.anchorBatch(proofKey, digest);
+      if (anchor) return await prisma.batchStage.update({ where: { id: stage.id }, data: { blockchainTx: anchor.txHash, blockchainNet: anchor.network } });
+    } catch (error) {
+      requestLogger.error({ err: error, batchCode: input.batchCode, stage: input.type }, "Batch stage recorded but blockchain anchor failed");
+    }
+    return stage;
+  };
+
+  const requestLogger = app.log;
+
+  const publicStageHistory = async (batchCode: string) => {
+    const stages = await prisma.batchStage.findMany({ where: { batch: { code: batchCode } }, orderBy: { sequence: "asc" } });
+    return Promise.all(stages.map(async (stage) => {
+      const fullMetadata = parseStageMetadata(stage.metadataJson);
+      const input = stageData({
+        batchCode,
+        type: stage.type,
+        sequence: stage.sequence,
+        occurredAt: stage.occurredAt.toISOString(),
+        actorId: stage.actorId,
+        status: stage.status,
+        metadata: fullMetadata,
+        previousDigest: stage.previousDigest,
+      });
+      const offchainVerified = digestBatchStage(input).toLowerCase() === stage.digest.toLowerCase();
+      const chainVerified = offchainVerified && await blockchain.verifyBatch(stage.proofKey, stage.digest) === true;
+      return {
+        type: stage.type,
+        sequence: stage.sequence,
+        occurredAt: stage.occurredAt,
+        status: stage.status,
+        metadata: publicStageMetadata(stage.type, fullMetadata),
+        proof: { verified: chainVerified, digest: `0x${stage.digest}`, transactionHash: stage.blockchainTx, network: stage.blockchainNet },
+      };
+    }));
   };
 
   app.get("/api/health", async () => {
@@ -229,13 +343,89 @@ export async function createApp(options: AppOptions = {}): Promise<FastifyInstan
     } catch (error) {
       request.log.error({ err: error, batchCode: code }, "Batch created but blockchain anchor failed");
     }
-    const result = await prisma.batch.findUnique({ where: { id: batch.id }, include: { hive: { select: { name: true } }, events: { orderBy: { createdAt: "asc" } } } });
+    await appendStage({
+      batchId: batch.id,
+      batchCode: batch.code,
+      batchDigest: batch.integrityDigest,
+      type: "HARVESTED",
+      occurredAt: harvestDate,
+      actorId: sub,
+      metadata: { quantityKg: parsed.data.quantityKg, floralSource: parsed.data.floralSource ?? null },
+    });
+    const result = await prisma.batch.findUnique({ where: { id: batch.id }, include: { hive: { select: { name: true } }, events: { orderBy: { createdAt: "asc" } }, stages: { orderBy: { sequence: "asc" } } } });
     return reply.code(201).send(result);
   });
 
   app.get("/api/batches", { preHandler: authenticate }, async (request) => {
     const { sub } = request.user as UserClaims;
-    return prisma.batch.findMany({ where: { beekeeperId: sub }, orderBy: { createdAt: "desc" }, include: { hive: { select: { name: true } }, events: { orderBy: { createdAt: "asc" } } } });
+    const batches = await prisma.batch.findMany({ where: { beekeeperId: sub }, orderBy: { createdAt: "desc" }, include: { hive: { select: { name: true } }, events: { orderBy: { createdAt: "asc" } }, stages: { orderBy: { sequence: "asc" } } } });
+    return batches.map((batch) => ({ ...batch, stages: batch.stages.map((stage) => ({ ...stage, metadata: parseStageMetadata(stage.metadataJson), metadataJson: undefined })) }));
+  });
+
+  app.get("/api/batches/:code/stages", { preHandler: authenticate }, async (request, reply) => {
+    const claims = request.user as UserClaims;
+    const { code } = request.params as { code: string };
+    const batch = await prisma.batch.findUnique({ where: { code }, select: { id: true, beekeeperId: true } });
+    if (!batch) return failure(reply, 404, "Batch not found");
+    const privileged = claims.role === UserRole.ADMIN || claims.role === UserRole.VERIFIER;
+    if (batch.beekeeperId !== claims.sub && !privileged) return failure(reply, 403, "You cannot view this batch's stage history");
+    const stages = await prisma.batchStage.findMany({ where: { batchId: batch.id }, orderBy: { sequence: "asc" } });
+    return stages.map((stage) => ({ ...stage, metadata: parseStageMetadata(stage.metadataJson), metadataJson: undefined }));
+  });
+
+  app.post("/api/batches/:code/stages", { preHandler: authenticate }, async (request, reply) => {
+    const parsed = stageSchema.safeParse(request.body);
+    if (!parsed.success) return failure(reply, 400, parsed.error.issues[0]?.message ?? "Invalid stage details");
+    const claims = request.user as UserClaims;
+    if (claims.role !== UserRole.BEEKEEPER && claims.role !== UserRole.ADMIN) return failure(reply, 403, "Only the beekeeper or an administrator can record operational stages");
+    const { code } = request.params as { code: string };
+    let batch = await prisma.batch.findUnique({ where: { code }, include: { stages: { orderBy: { sequence: "desc" }, take: 1 } } });
+    if (!batch) return failure(reply, 404, "Batch not found");
+    if (claims.role !== UserRole.ADMIN && batch.beekeeperId !== claims.sub) return failure(reply, 403, "You cannot update this batch");
+
+    if (batch.status === BatchStatus.VERIFIED && batch.stages.length === 0) {
+      const priorReview = await prisma.batchEvent.findFirst({ where: { batchId: batch.id, type: "VERIFICATION_VERIFIED" }, orderBy: { createdAt: "asc" } });
+      await appendStage({ batchId: batch.id, batchCode: batch.code, batchDigest: batch.integrityDigest, type: "HARVESTED", occurredAt: batch.harvestDate, actorId: batch.beekeeperId, metadata: { quantityKg: batch.quantityKg, floralSource: batch.floralSource } });
+      await appendStage({ batchId: batch.id, batchCode: batch.code, batchDigest: batch.integrityDigest, type: "VERIFIED", occurredAt: priorReview?.createdAt ?? new Date(), actorId: priorReview?.actorId ?? null, metadata: { decision: "VERIFIED" } });
+      batch = await prisma.batch.findUnique({ where: { code }, include: { stages: { orderBy: { sequence: "desc" }, take: 1 } } });
+      if (!batch) return failure(reply, 404, "Batch not found");
+    }
+
+    const expectedPredecessor: Record<string, LedgerStageType> = { PROCESSED: "VERIFIED", PACKAGED: "PROCESSED", DISTRIBUTED: "PACKAGED" };
+    const predecessor = expectedPredecessor[parsed.data.type];
+    const latest = batch.stages[0];
+    if (!latest || latest.type !== predecessor || batch.status !== BatchStatus.VERIFIED) return failure(reply, 409, `${parsed.data.type} requires the preceding verified stage`);
+    const expectedDigest = digestBatchStage(stageData({
+      batchCode: batch.code,
+      type: latest.type,
+      sequence: latest.sequence,
+      occurredAt: latest.occurredAt.toISOString(),
+      actorId: latest.actorId,
+      status: latest.status,
+      metadata: parseStageMetadata(latest.metadataJson),
+      previousDigest: latest.previousDigest,
+    }));
+    if (expectedDigest.toLowerCase() !== latest.digest.toLowerCase() || await blockchain.verifyBatch(latest.proofKey, latest.digest) !== true) {
+      return failure(reply, 409, "A valid blockchain proof for the preceding stage is required");
+    }
+
+    const { occurredAt: requestedAt, metadata } = stageMetadata(parsed.data);
+    if (requestedAt.toISOString().slice(0, 10) < latest.occurredAt.toISOString().slice(0, 10)) return failure(reply, 400, "Stage date cannot precede the previous stage");
+    const occurredAt = requestedAt <= latest.occurredAt ? new Date(latest.occurredAt.getTime() + 1000) : requestedAt;
+    try {
+      const stage = await appendStage({ batchId: batch.id, batchCode: batch.code, batchDigest: batch.integrityDigest, type: parsed.data.type, occurredAt, actorId: claims.sub, metadata });
+      return reply.code(201).send({ ...stage, metadata, metadataJson: undefined });
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "P2002") return failure(reply, 409, "This batch stage has already been recorded");
+      throw error;
+    }
+  });
+
+  app.get("/api/public/batches/:code/stages", async (request, reply) => {
+    const { code } = request.params as { code: string };
+    const batch = await prisma.batch.findUnique({ where: { code }, select: { id: true } });
+    if (!batch) return failure(reply, 404, "Batch not found");
+    return publicStageHistory(code);
   });
 
   app.patch("/api/batches/:code/status", { preHandler: authenticate }, async (request, reply) => {
@@ -286,21 +476,34 @@ export async function createApp(options: AppOptions = {}): Promise<FastifyInstan
       prisma.batch.update({ where: { id: batch.id }, data: { status: parsed.data.decision } }),
       prisma.batchEvent.create({ data: { batchId: batch.id, type: `VERIFICATION_${parsed.data.decision}`, note: parsed.data.note, actorId: sub } }),
     ]);
+    if (parsed.data.decision === "VERIFIED") {
+      const harvested = await prisma.batchStage.findFirst({ where: { batchId: batch.id, type: "HARVESTED" } });
+      if (!harvested) await appendStage({ batchId: batch.id, batchCode: batch.code, batchDigest: batch.integrityDigest, type: "HARVESTED", occurredAt: batch.harvestDate, actorId: batch.beekeeperId, metadata: { quantityKg: batch.quantityKg, floralSource: batch.floralSource } });
+      await appendStage({
+        batchId: batch.id,
+        batchCode: batch.code,
+        batchDigest: batch.integrityDigest,
+        type: "VERIFIED",
+        occurredAt: new Date(),
+        actorId: sub,
+        metadata: { decision: "VERIFIED", note: parsed.data.note },
+      });
+    }
     return updated;
   });
 
   app.get("/api/batches/:code", { preHandler: authenticate }, async (request, reply) => {
     const { sub } = request.user as UserClaims;
     const { code } = request.params as { code: string };
-    const batch = await prisma.batch.findFirst({ where: { code, beekeeperId: sub }, include: { hive: { select: { name: true, location: true } }, events: { orderBy: { createdAt: "asc" } } } });
-    return batch ?? failure(reply, 404, "Batch not found");
+    const batch = await prisma.batch.findFirst({ where: { code, beekeeperId: sub }, include: { hive: { select: { name: true, location: true } }, events: { orderBy: { createdAt: "asc" } }, stages: { orderBy: { sequence: "asc" } } } });
+    return batch ? { ...batch, stages: batch.stages.map((stage) => ({ ...stage, metadata: parseStageMetadata(stage.metadataJson), metadataJson: undefined })) } : failure(reply, 404, "Batch not found");
   });
 
   app.get("/api/public/batches/:code", async (request, reply) => {
     const { code } = request.params as { code: string };
     const batch = await prisma.batch.findUnique({
       where: { code },
-      select: { code: true, hiveId: true, harvestDate: true, quantityKg: true, floralSource: true, status: true, integrityDigest: true, blockchainTx: true, blockchainNet: true, createdAt: true, hive: { select: { name: true, location: true } }, beekeeper: { select: { name: true } }, events: { orderBy: { createdAt: "asc" }, select: { type: true, note: true, createdAt: true } } },
+      select: { code: true, hiveId: true, harvestDate: true, quantityKg: true, floralSource: true, status: true, integrityDigest: true, blockchainTx: true, blockchainNet: true, createdAt: true, hive: { select: { name: true } }, events: { orderBy: { createdAt: "asc" }, select: { type: true, note: true, createdAt: true } } },
     });
     if (!batch) return failure(reply, 404, "Batch not found");
     const currentDigest = digestBatch({ code: batch.code, hiveId: batch.hiveId, quantityKg: batch.quantityKg, harvestDate: batch.harvestDate.toISOString(), floralSource: batch.floralSource });
@@ -312,9 +515,17 @@ export async function createApp(options: AppOptions = {}): Promise<FastifyInstan
         ? chainProof ? chainProof.dataDigest.toLowerCase() === `0x${currentDigest}`.toLowerCase() : blockchain.isConfigured() ? false : null
         : await blockchain.verifyBatch(batch.code, currentDigest);
     const verification = !offchainIntact ? "OFFCHAIN_TAMPERED" : chainVerified === true ? "VERIFIED_ON_CHAIN" : chainVerified === false ? "CHAIN_MISMATCH" : "NOT_ANCHORED";
-    const { hiveId: _hiveId, ...publicBatch } = batch;
+    const { hiveId: _hiveId, events, ...publicBatch } = batch;
+    const publicStages = await publicStageHistory(code);
     return {
       ...publicBatch,
+      beekeeper: { name: "a registered beekeeper" },
+      events: events.map((event) => ({
+        type: event.type,
+        note: event.type === "VERIFICATION_VERIFIED" ? "Batch approved by an authorized verifier" : event.type === "VERIFICATION_REJECTED" ? "Batch was not approved" : event.type === "BLOCKCHAIN_ANCHORED" ? "Batch integrity digest anchored on-chain" : event.type.replaceAll("_", " ").toLowerCase(),
+        createdAt: event.createdAt,
+      })),
+      stages: publicStages,
       chainProof: chainProof ? {
         ...chainProof,
         transactionHash: batch.blockchainTx,
@@ -323,6 +534,28 @@ export async function createApp(options: AppOptions = {}): Promise<FastifyInstan
       chainVerified,
       verification,
     };
+  });
+
+  app.post("/api/public/batches/:code/verify", async (request, reply) => {
+    const { code } = request.params as { code: string };
+    const batch = await prisma.batch.findUnique({ where: { code }, include: { stages: { orderBy: { sequence: "desc" }, take: 1 } } });
+    if (!batch) return failure(reply, 404, "Batch not found");
+    if (batch.stages[0]?.type !== "DISTRIBUTED") return failure(reply, 409, "Consumer verification is available after distribution");
+    const distribution = batch.stages[0];
+    const distributionData = stageData({
+      batchCode: batch.code,
+      type: distribution.type,
+      sequence: distribution.sequence,
+      occurredAt: distribution.occurredAt.toISOString(),
+      actorId: distribution.actorId,
+      status: distribution.status,
+      metadata: parseStageMetadata(distribution.metadataJson),
+      previousDigest: distribution.previousDigest,
+    });
+    if (digestBatchStage(distributionData).toLowerCase() !== distribution.digest.toLowerCase() || await blockchain.verifyBatch(distribution.proofKey, distribution.digest) !== true) return failure(reply, 409, "A valid distribution stage proof is required");
+    const occurredAt = new Date(Math.max(Date.now(), distribution.occurredAt.getTime() + 1000));
+    const stage = await appendStage({ batchId: batch.id, batchCode: batch.code, batchDigest: batch.integrityDigest, type: "CONSUMER_VERIFIED", occurredAt, actorId: null, metadata: { channel: "PUBLIC_QR" } });
+    return reply.code(201).send({ type: stage.type, occurredAt: stage.occurredAt, proof: { verified: Boolean(stage.blockchainTx), digest: `0x${stage.digest}`, transactionHash: stage.blockchainTx, network: stage.blockchainNet } });
   });
 
   app.get("/api/blockchain/status", async () => ({ configured: blockchain.isConfigured(), network: process.env.BLOCKCHAIN_CHAIN_ID ?? null, contractAddress: process.env.CONTRACT_ADDRESS ?? null }));

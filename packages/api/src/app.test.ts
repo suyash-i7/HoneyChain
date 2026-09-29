@@ -19,7 +19,7 @@ const appPromise = createApp({
   jwtSecret: "integration-test-secret-that-is-long-enough",
   blockchain: {
     isConfigured: () => blockchainAvailable,
-    anchorBatch: async () => null,
+    anchorBatch: async () => ({ txHash: `0x${"1".repeat(64)}`, network: "31337" }),
     verifyBatch: async () => blockchainAvailable ? true : null,
   },
 });
@@ -117,6 +117,14 @@ test("beekeeper can register a hive, ingest sensors, create a batch, and expose 
   batchId = batch.id;
   assert.match(batch.code, /^HC-\d{4}-[A-F0-9]{8}$/);
   assert.equal(batch.events[0].type, "BATCH_CREATED");
+  assert.deepEqual(batch.stages.map((stage: { type: string }) => stage.type), ["HARVESTED"]);
+
+  const unauthenticatedStage = await app.inject({ method: "POST", url: `/api/batches/${batch.code}/stages`, payload: { type: "PROCESSED", method: "filtered", quantityKg: 14 } });
+  assert.equal(unauthenticatedStage.statusCode, 401);
+  const wrongOrderStage = await app.inject({ method: "POST", url: `/api/batches/${batch.code}/stages`, headers: auth, payload: { type: "PACKAGED", quantityKg: 14 } });
+  assert.equal(wrongOrderStage.statusCode, 409);
+  const invalidStagePayload = await app.inject({ method: "POST", url: `/api/batches/${batch.code}/stages`, headers: auth, payload: { type: "PROCESSED", method: "x", quantityKg: -1 } });
+  assert.equal(invalidStagePayload.statusCode, 400);
 
   const invalidTransition = await app.inject({
     method: "PATCH",
@@ -186,12 +194,46 @@ test("beekeeper can register a hive, ingest sensors, create a batch, and expose 
   assert.equal(decision.statusCode, 200);
   assert.equal(decision.json().status, "VERIFIED");
 
+  const ownerStageHistory = await app.inject({ method: "GET", url: `/api/batches/${batch.code}/stages`, headers: auth });
+  assert.equal(ownerStageHistory.statusCode, 200);
+  assert.deepEqual(ownerStageHistory.json().map((stage: { type: string }) => stage.type), ["HARVESTED", "VERIFIED"]);
+  const unauthorizedStageHistory = await app.inject({ method: "GET", url: `/api/batches/${batch.code}/stages` });
+  assert.equal(unauthorizedStageHistory.statusCode, 401);
+  const processedStage = await app.inject({
+    method: "POST",
+    url: `/api/batches/${batch.code}/stages`,
+    headers: auth,
+    payload: { type: "PROCESSED", processedAt: harvestDate, method: "Settling and filtration", quantityKg: 13.8, notes: "internal processing note" },
+  });
+  assert.equal(processedStage.statusCode, 201);
+  const packagedStage = await app.inject({ method: "POST", url: `/api/batches/${batch.code}/stages`, headers: auth, payload: { type: "PACKAGED", packagedAt: harvestDate, packageType: "Glass jar", lotIdentifier: "LOT-24-A", quantityKg: 13.5, notes: "internal packing note" } });
+  assert.equal(packagedStage.statusCode, 201);
+  const distributedStage = await app.inject({ method: "POST", url: `/api/batches/${batch.code}/stages`, headers: auth, payload: { type: "DISTRIBUTED", distributedAt: harvestDate, destination: "Central market", quantityKg: 13.5, notes: "private dispatch note" } });
+  assert.equal(distributedStage.statusCode, 201);
+
   const publicRecord = await app.inject({ method: "GET", url: `/api/public/batches/${batch.code}` });
   assert.equal(publicRecord.statusCode, 200);
   assert.equal(publicRecord.json().verification, "VERIFIED_ON_CHAIN");
   assert.equal(publicRecord.json().status, "VERIFIED");
   assert.equal(publicRecord.json().events.at(-1).type, "VERIFICATION_VERIFIED");
   assert.equal(publicRecord.json().hive.name, "Test orchard hive");
+  assert.deepEqual(publicRecord.json().stages.map((stage: { type: string }) => stage.type), ["HARVESTED", "VERIFIED", "PROCESSED", "PACKAGED", "DISTRIBUTED"]);
+  assert.equal(publicRecord.json().stages[2].proof.verified, true);
+  assert.equal(publicRecord.json().stages[2].metadata.notes, undefined);
+  assert.equal(publicRecord.json().stages[4].metadata.destination, "Central market");
+  assert.equal(publicRecord.json().stages[4].actorId, undefined);
+  assert.equal(publicRecord.json().stages[4].id, undefined);
+  assert.equal(publicRecord.json().stages[4].metadata.notes, undefined);
+  assert.deepEqual(publicRecord.json().beekeeper, { name: "a registered beekeeper" });
+  assert.equal(publicRecord.json().hive.location, undefined);
+  const publicStageHistory = await app.inject({ method: "GET", url: `/api/public/batches/${batch.code}/stages` });
+  assert.equal(publicStageHistory.statusCode, 200);
+  assert.equal(publicStageHistory.json()[2].metadata.notes, undefined);
+  const consumerVerification = await app.inject({ method: "POST", url: `/api/public/batches/${batch.code}/verify` });
+  assert.equal(consumerVerification.statusCode, 201);
+  assert.equal(consumerVerification.json().type, "CONSUMER_VERIFIED");
+  const publicAfterConsumer = await app.inject({ method: "GET", url: `/api/public/batches/${batch.code}/stages` });
+  assert.deepEqual(publicAfterConsumer.json().map((stage: { type: string }) => stage.type), ["HARVESTED", "VERIFIED", "PROCESSED", "PACKAGED", "DISTRIBUTED", "CONSUMER_VERIFIED"]);
 
   const rejectionBatchResponse = await app.inject({
     method: "POST",
@@ -240,6 +282,8 @@ test("beekeeper can register a hive, ingest sensors, create a batch, and expose 
     headers: { authorization: `Bearer ${secondaryRegistration.json().token}` },
   });
   assert.equal(foreignReading.statusCode, 404);
+  const foreignStage = await app.inject({ method: "POST", url: `/api/batches/${batch.code}/stages`, headers: { authorization: `Bearer ${secondaryRegistration.json().token as string}` }, payload: { type: "PROCESSED", method: "filtered", quantityKg: 12 } });
+  assert.equal(foreignStage.statusCode, 403);
 });
 
 test("hive analytics classifies sensor evidence and protects private hives", async () => {
@@ -355,11 +399,13 @@ test("real chain supports batch traceability through public consumer proof", asy
 
     const rpcUrl = `http://127.0.0.1:${port}`;
     const hardhatCli = path.join(repoRoot, "node_modules", "hardhat", "internal", "cli", "cli.js");
+    let hardhatOutput = "";
     chainProcess = spawn(process.execPath, [hardhatCli, "node", "--hostname", "127.0.0.1", "--port", String(port)], {
       cwd: path.join(repoRoot, "packages", "contracts"),
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", "pipe"],
       windowsHide: true,
     });
+    chainProcess.stderr?.on("data", (chunk: Buffer) => { hardhatOutput += chunk.toString(); });
 
     let chainReady = false;
     for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -375,11 +421,12 @@ test("real chain supports batch traceability through public consumer proof", asy
           chainReady = true;
           break;
         }
+        await new Promise((resolve) => setTimeout(resolve, 100));
       } catch {
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
     }
-    assert.equal(chainReady, true, "local Hardhat chain starts on chain 31337");
+    assert.equal(chainReady, true, `local Hardhat chain starts on chain 31337${hardhatOutput ? `: ${hardhatOutput}` : ""}`);
 
     const artifactPath = path.join(repoRoot, "packages", "contracts", "artifacts", "contracts", "BatchRegistry.sol", "BatchRegistry.json");
     const artifact = JSON.parse(await readFile(artifactPath, "utf8")) as { abi: ConstructorParameters<typeof ContractFactory>[0]; bytecode: string };
@@ -444,6 +491,24 @@ test("real chain supports batch traceability through public consumer proof", asy
     assert.equal(decision.statusCode, 200);
     assert.equal(decision.json().status, "VERIFIED");
 
+    const stagePayloads = [
+      { type: "PROCESSED", processedAt: new Date().toISOString().slice(0, 10), method: "Settling and filtration", quantityKg: 11.8 },
+      { type: "PACKAGED", packagedAt: new Date().toISOString().slice(0, 10), packageType: "Glass jar", quantityKg: 11.5 },
+      { type: "DISTRIBUTED", distributedAt: new Date().toISOString().slice(0, 10), destination: "Regional market", quantityKg: 11.5 },
+    ];
+    for (const payload of stagePayloads) {
+      const stageResponse: { statusCode: number; json: () => { blockchainTx: string } } = await realApp.inject({ method: "POST", url: `/api/batches/${batch.code}/stages`, headers: keeperAuth, payload });
+      assert.equal(stageResponse.statusCode, 201);
+      assert.match(stageResponse.json().blockchainTx, /^0x[a-fA-F0-9]{64}$/);
+    }
+    const ledger = await prisma.batchStage.findMany({ where: { batchId: createdBatchId }, orderBy: { sequence: "asc" } });
+    assert.deepEqual(ledger.map((stage) => stage.type), ["HARVESTED", "VERIFIED", "PROCESSED", "PACKAGED", "DISTRIBUTED"]);
+    for (const stage of ledger) {
+      const chainStage = await (registry as unknown as { getBatch: (key: string) => Promise<{ dataDigest: string; recordedAt: bigint }> }).getBatch(stage.proofKey);
+      assert.equal(chainStage.dataDigest.toLowerCase(), `0x${stage.digest}`.toLowerCase());
+      assert.ok(chainStage.recordedAt > 0n);
+    }
+
     const publicResponse = await realApp.inject({ method: "GET", url: `/api/public/batches/${batch.code}` });
     assert.equal(publicResponse.statusCode, 200);
     const publicBatch = publicResponse.json();
@@ -458,8 +523,12 @@ test("real chain supports batch traceability through public consumer proof", asy
     assert.equal(publicBatch.chainProof.network, "31337");
     assert.equal(publicBatch.chainProof.contractAddress, await registry.getAddress());
     assert.equal(publicBatch.chainProof.transactionHash, batch.blockchainTx);
+    assert.equal(publicBatch.stages.length, 5);
+    assert.equal(publicBatch.stages.every((stage: { proof: { verified: boolean } }) => stage.proof.verified), true);
+    assert.equal(publicBatch.stages[2].metadata.method, "Settling and filtration");
+    assert.equal(publicBatch.stages[2].metadata.actorId, undefined);
     assert.equal(publicBatch.events.at(-1).type, "VERIFICATION_VERIFIED");
-    assert.equal(publicBatch.events.at(-1).note, "Sample and source records checked against the anchored digest");
+    assert.equal(publicBatch.events.at(-1).note, "Batch approved by an authorized verifier");
 
     const invalidBatch = await realApp.inject({ method: "GET", url: "/api/public/batches/not-a-real-batch" });
     assert.equal(invalidBatch.statusCode, 404);

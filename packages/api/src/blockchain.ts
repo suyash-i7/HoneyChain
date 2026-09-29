@@ -18,6 +18,33 @@ export type ChainBatchProof = {
   network: string;
 };
 
+export type BatchStageDigestInput = {
+  batchCode: string;
+  type: string;
+  sequence: number;
+  occurredAt: string;
+  actorId: string | null;
+  status: string;
+  metadata: Record<string, unknown>;
+  previousDigest: string;
+};
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, canonicalize(entry)]));
+  }
+  return value;
+}
+
+export function batchStageProofKey(batchCode: string, sequence: number): string {
+  return `${batchCode}:STAGE:${sequence}`;
+}
+
+export function digestBatchStage(data: BatchStageDigestInput): string {
+  return keccak256(toUtf8Bytes(JSON.stringify(canonicalize(data)))).slice(2);
+}
+
 export class BlockchainService {
   private readonly rpcUrl = process.env.BLOCKCHAIN_RPC_URL;
   private readonly contractAddress = process.env.CONTRACT_ADDRESS;

@@ -54,6 +54,20 @@ export type Hive = {
   readings: SensorReading[];
 };
 export type BatchEvent = { id: string; type: string; note: string; createdAt: string };
+export type BatchStageType = "HARVESTED" | "VERIFIED" | "PROCESSED" | "PACKAGED" | "DISTRIBUTED" | "CONSUMER_VERIFIED";
+export type BatchStage = {
+  id?: string;
+  type: BatchStageType;
+  sequence: number;
+  occurredAt: string;
+  status: string;
+  actorId?: string | null;
+  metadata: Record<string, unknown>;
+  digest?: string;
+  blockchainTx?: string | null;
+  blockchainNet?: string | null;
+  proof?: { verified: boolean; digest: string; transactionHash: string | null; network: string | null };
+};
 export type Batch = {
   id: string;
   code: string;
@@ -67,4 +81,5 @@ export type Batch = {
   hive?: { name: string; location?: string };
   beekeeper?: { id?: string; name: string };
   events: BatchEvent[];
+  stages?: BatchStage[];
 };

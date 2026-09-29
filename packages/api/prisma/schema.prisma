@@ -79,6 +79,7 @@ model Batch {
   beekeeperId     String
   beekeeper       User         @relation(fields: [beekeeperId], references: [id], onDelete: Restrict)
   events          BatchEvent[]
+  stages          BatchStage[]
   createdAt       DateTime     @default(now())
 
   @@index([beekeeperId, createdAt])
@@ -94,4 +95,26 @@ model BatchEvent {
   createdAt  DateTime @default(now())
 
   @@index([batchId, createdAt])
+}
+
+model BatchStage {
+  id            String   @id @default(cuid())
+  batchId       String
+  batch         Batch    @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  type          String
+  sequence      Int
+  occurredAt    DateTime
+  actorId       String?
+  status        String   @default("RECORDED")
+  metadataJson  String   @default("{}")
+  previousDigest String
+  digest        String
+  proofKey      String   @unique
+  blockchainTx  String?
+  blockchainNet String?
+  recordedAt    DateTime @default(now())
+
+  @@unique([batchId, type])
+  @@unique([batchId, sequence])
+  @@index([batchId, sequence])
 }
